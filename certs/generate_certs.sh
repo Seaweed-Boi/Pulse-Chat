@@ -27,9 +27,9 @@ if ! command -v openssl &> /dev/null; then
 fi
 
 # Certificate details
-COUNTRY="US"
-STATE="State"
-CITY="City"
+COUNTRY="India"
+STATE="Karnataka"
+CITY="Bangalore"
 ORG="Pulse-Chat"
 UNIT="Development"
 CN="localhost"              # Common Name - should match server hostname
@@ -65,7 +65,7 @@ if [ $? -eq 0 ]; then
     echo
     
     # Display certificate details
-    echo "Certificate Information:"
+    echo "Certificate Informatio`n:"
     echo "------------------------"
     openssl x509 -in server.crt -noout -subject -dates
     echo
