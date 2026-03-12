@@ -1,0 +1,13 @@
+# Pulse-Chat Requirements
+#
+# This project uses only Python standard library modules.
+# No external dependencies are required.
+#
+# Standard library modules used:
+# - socket: TCP socket programming
+# - ssl: SSL/TLS encryption
+# - threading: Concurrent client handling
+# - json: Message serialization
+# - datetime: Timestamps
+#
+# Minimum Python version: 3.7
