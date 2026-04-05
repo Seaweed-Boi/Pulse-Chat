@@ -19,8 +19,10 @@ import socket
 import ssl
 import threading
 import os
-from typing import List, Optional
+import uuid
+from typing import Dict, List, Optional
 from server.client_handler import ClientHandler
+from server.user_store import UserStore
 from utils.message_protocol import MessageProtocol
 
 
@@ -49,11 +51,16 @@ class ChatServer:
         self.port = port
         self.cert_file = cert_file
         self.key_file = key_file
+        self.user_store = UserStore(base_dir='data')
         
         # List of connected clients - needs thread-safe access
         self.clients: List[ClientHandler] = []
         # Lock for thread-safe access to the clients list
         self.clients_lock = threading.Lock()
+
+        # Active user routing map for direct messages
+        self.user_lock = threading.Lock()
+        self.user_to_client: Dict[str, ClientHandler] = {}
         
         # Server state
         self.running = False
@@ -125,7 +132,14 @@ class ChatServer:
                         client_socket=client_socket,
                         client_address=client_address,
                         broadcast_callback=self.broadcast_message,
-                        remove_callback=self.remove_client
+                        remove_callback=self.remove_client,
+                        login_callback=self.handle_user_login,
+                        disconnect_callback=self.handle_user_disconnect,
+                        persist_callback=self.persist_message_for_users,
+                        register_user_callback=self.register_active_user,
+                        unregister_user_callback=self.unregister_active_user,
+                        private_message_callback=self.route_private_message,
+                        file_frame_callback=self.route_file_frame
                     )
                     
                     # Add to clients list (thread-safe)
@@ -183,12 +197,133 @@ class ChatServer:
             if client in self.clients:
                 self.clients.remove(client)
                 print(f"[SERVER] Removed client. Active clients: {len(self.clients)}")
+
+    def register_active_user(self, username: str, handler: ClientHandler):
+        """Register or refresh active user route for private messaging."""
+        if not username:
+            return
+        with self.user_lock:
+            self.user_to_client[username] = handler
+
+    def unregister_active_user(self, username: str, handler: Optional[ClientHandler] = None):
+        """Remove active user route when user disconnects."""
+        if not username:
+            return
+        with self.user_lock:
+            existing = self.user_to_client.get(username)
+            if existing is None:
+                return
+            if handler is None or existing == handler:
+                self.user_to_client.pop(username, None)
+
+    def route_private_message(
+        self,
+        from_username: str,
+        to_username: str,
+        content: str,
+        message_id: Optional[str] = None
+    ) -> dict:
+        """Route a private message only to the addressed online user."""
+        with self.user_lock:
+            recipient = self.user_to_client.get(to_username)
+
+        if not recipient:
+            # Offline policy: reject private message delivery when recipient is offline.
+            return {
+                'ok': False,
+                'error': f"User '{to_username}' is offline. DM not delivered.",
+                'offline': True
+            }
+
+        msg_id = message_id or str(uuid.uuid4())
+        dm_message = MessageProtocol.create_message(
+            MessageProtocol.TYPE_PRIVATE,
+            from_username,
+            content,
+            to_username=to_username,
+            message_id=msg_id
+        )
+        recipient.send_message(dm_message)
+
+        # Persist delivered DMs for both sender and receiver history replay.
+        self.user_store.append_message_for_users([from_username, to_username], dm_message)
+
+        return {
+            'ok': True,
+            'message_id': msg_id
+        }
+
+    def route_file_frame(self, from_username: str, message: dict) -> dict:
+        """Route file transfer frames to a direct recipient or globally."""
+        msg_type = message.get('type')
+        if msg_type not in {
+            MessageProtocol.TYPE_FILE_OFFER,
+            MessageProtocol.TYPE_FILE_CHUNK,
+            MessageProtocol.TYPE_FILE_END,
+            MessageProtocol.TYPE_FILE_ACK,
+            MessageProtocol.TYPE_FILE_ERROR
+        }:
+            return {'ok': False, 'error': 'Invalid file frame type.'}
+
+        # Keep sender identity server-authoritative.
+        message['username'] = from_username
+
+        to_username = (message.get('to_username') or '').strip()
+        room = (message.get('room') or '').strip().lower()
+
+        if to_username:
+            with self.user_lock:
+                recipient = self.user_to_client.get(to_username)
+
+            if not recipient:
+                return {
+                    'ok': False,
+                    'error': f"User '{to_username}' is offline. File frame not delivered.",
+                    'offline': True
+                }
+
+            recipient.send_message(message)
+            return {'ok': True}
+
+        # Room-wide path currently supports broadcast-to-all.
+        if room == 'all':
+            sender = None
+            with self.user_lock:
+                sender = self.user_to_client.get(from_username)
+            self.broadcast_message(message, exclude=sender)
+            return {'ok': True}
+
+        return {
+            'ok': False,
+            'error': "File target missing or unsupported. Use username or room='all'."
+        }
+
+    def handle_user_login(self, username: str) -> dict:
+        """Register user login and return profile/history payload."""
+        login_info = self.user_store.register_login(username)
+        history = self.user_store.get_user_history(username, limit=100)
+        payload = dict(login_info)
+        payload['history'] = history
+        return payload
+
+    def handle_user_disconnect(self, username: str):
+        """Persist last-seen timestamp when user disconnects."""
+        self.user_store.update_last_seen(username)
+
+    def persist_message_for_users(self, message: dict):
+        """Persist broadcasted message for every known user."""
+        usernames = self.user_store.list_users()
+        if usernames:
+            self.user_store.append_message_for_users(usernames, message)
     
     def stop(self):
         """
         Stop the server and clean up resources.
         """
         self.running = False
+
+        with self.user_lock:
+            self.user_to_client.clear()
         
         # Close all client connections
         with self.clients_lock:
