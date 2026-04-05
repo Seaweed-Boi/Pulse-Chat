@@ -19,8 +19,11 @@ import socket
 import ssl
 import threading
 import os
-from typing import List, Optional
+import uuid
+from queue import Empty, Queue
+from typing import Dict, List, Optional
 from server.client_handler import ClientHandler
+from server.user_store import UserStore
 from utils.message_protocol import MessageProtocol
 
 
@@ -49,11 +52,22 @@ class ChatServer:
         self.port = port
         self.cert_file = cert_file
         self.key_file = key_file
+        self.user_store = UserStore(base_dir='data')
         
         # List of connected clients - needs thread-safe access
         self.clients: List[ClientHandler] = []
         # Lock for thread-safe access to the clients list
         self.clients_lock = threading.Lock()
+
+        # Active user routing map for direct messages
+        self.user_lock = threading.Lock()
+        self.user_to_client: Dict[str, ClientHandler] = {}
+
+        # Ordered per-room publish state
+        self.room_lock = threading.Lock()
+        self.room_sequence_counter: Dict[str, int] = {}
+        self.room_queues: Dict[str, Queue] = {}
+        self.room_workers: Dict[str, threading.Thread] = {}
         
         # Server state
         self.running = False
@@ -125,7 +139,17 @@ class ChatServer:
                         client_socket=client_socket,
                         client_address=client_address,
                         broadcast_callback=self.broadcast_message,
-                        remove_callback=self.remove_client
+                        ordered_room_publish_callback=self.publish_room_ordered,
+                        remove_callback=self.remove_client,
+                        login_callback=self.handle_user_login,
+                        room_history_callback=self.get_room_history,
+                        persist_room_history_callback=self.persist_room_message,
+                        disconnect_callback=self.handle_user_disconnect,
+                        persist_callback=self.persist_message_for_users,
+                        register_user_callback=self.register_active_user,
+                        unregister_user_callback=self.unregister_active_user,
+                        private_message_callback=self.route_private_message,
+                        file_frame_callback=self.route_file_frame
                     )
                     
                     # Add to clients list (thread-safe)
@@ -152,6 +176,68 @@ class ChatServer:
             print(f"[SERVER] Error: {e}")
         finally:
             self.stop()
+
+    def _ensure_room_worker_locked(self, room_name: str):
+        """Create queue/worker for a room if it doesn't exist."""
+        if room_name in self.room_workers:
+            worker = self.room_workers[room_name]
+            if worker.is_alive():
+                return
+
+        room_queue = self.room_queues.get(room_name)
+        if room_queue is None:
+            room_queue = Queue()
+            self.room_queues[room_name] = room_queue
+
+        worker = threading.Thread(
+            target=self._room_dispatch_worker,
+            args=(room_name, room_queue),
+            daemon=True
+        )
+        self.room_workers[room_name] = worker
+        worker.start()
+
+    def _room_dispatch_worker(self, room_name: str, room_queue: Queue):
+        """Dispatch room messages in FIFO order to guarantee per-room ordering."""
+        while self.running:
+            try:
+                item = room_queue.get(timeout=0.5)
+            except Empty:
+                continue
+
+            if item is None:
+                break
+
+            message, exclude = item
+            with self.clients_lock:
+                recipients = [client for client in self.clients if client != exclude]
+
+            for client in recipients:
+                client.send_message(message)
+
+            room_queue.task_done()
+
+    def publish_room_ordered(
+        self,
+        room_name: str,
+        message: dict,
+        exclude: Optional[ClientHandler] = None
+    ) -> dict:
+        """Publish a message through the room sequencer and ordered worker queue."""
+        room = (room_name or 'global').strip() or 'global'
+
+        with self.room_lock:
+            next_seq = self.room_sequence_counter.get(room, 0) + 1
+            self.room_sequence_counter[room] = next_seq
+
+            ordered_message = dict(message)
+            ordered_message['room_name'] = room
+            ordered_message['room_seq'] = next_seq
+
+            self._ensure_room_worker_locked(room)
+            self.room_queues[room].put((ordered_message, exclude))
+
+        return ordered_message
     
     def broadcast_message(self, message: dict, exclude: Optional[ClientHandler] = None):
         """
@@ -183,12 +269,148 @@ class ChatServer:
             if client in self.clients:
                 self.clients.remove(client)
                 print(f"[SERVER] Removed client. Active clients: {len(self.clients)}")
+
+    def register_active_user(self, username: str, handler: ClientHandler):
+        """Register or refresh active user route for private messaging."""
+        if not username:
+            return
+        with self.user_lock:
+            self.user_to_client[username] = handler
+
+    def unregister_active_user(self, username: str, handler: Optional[ClientHandler] = None):
+        """Remove active user route when user disconnects."""
+        if not username:
+            return
+        with self.user_lock:
+            existing = self.user_to_client.get(username)
+            if existing is None:
+                return
+            if handler is None or existing == handler:
+                self.user_to_client.pop(username, None)
+
+    def route_private_message(
+        self,
+        from_username: str,
+        to_username: str,
+        content: str,
+        message_id: Optional[str] = None
+    ) -> dict:
+        """Route a private message only to the addressed online user."""
+        with self.user_lock:
+            recipient = self.user_to_client.get(to_username)
+
+        if not recipient:
+            # Offline policy: reject private message delivery when recipient is offline.
+            return {
+                'ok': False,
+                'error': f"User '{to_username}' is offline. DM not delivered.",
+                'offline': True
+            }
+
+        msg_id = message_id or str(uuid.uuid4())
+        dm_message = MessageProtocol.create_message(
+            MessageProtocol.TYPE_PRIVATE,
+            from_username,
+            content,
+            to_username=to_username,
+            message_id=msg_id
+        )
+        recipient.send_message(dm_message)
+
+        # Persist delivered DMs for both sender and receiver history replay.
+        self.user_store.append_message_for_users([from_username, to_username], dm_message)
+
+        return {
+            'ok': True,
+            'message_id': msg_id
+        }
+
+    def route_file_frame(self, from_username: str, message: dict) -> dict:
+        """Route file transfer frames to a direct recipient or globally."""
+        msg_type = message.get('type')
+        if msg_type not in {
+            MessageProtocol.TYPE_FILE_OFFER,
+            MessageProtocol.TYPE_FILE_CHUNK,
+            MessageProtocol.TYPE_FILE_END,
+            MessageProtocol.TYPE_FILE_ACK,
+            MessageProtocol.TYPE_FILE_ERROR
+        }:
+            return {'ok': False, 'error': 'Invalid file frame type.'}
+
+        # Keep sender identity server-authoritative.
+        message['username'] = from_username
+
+        to_username = (message.get('to_username') or '').strip()
+        room = (message.get('room') or '').strip().lower()
+
+        if to_username:
+            with self.user_lock:
+                recipient = self.user_to_client.get(to_username)
+
+            if not recipient:
+                return {
+                    'ok': False,
+                    'error': f"User '{to_username}' is offline. File frame not delivered.",
+                    'offline': True
+                }
+
+            recipient.send_message(message)
+            return {'ok': True}
+
+        # Room-wide path currently supports broadcast-to-all.
+        if room == 'all':
+            sender = None
+            with self.user_lock:
+                sender = self.user_to_client.get(from_username)
+            self.broadcast_message(message, exclude=sender)
+            return {'ok': True}
+
+        return {
+            'ok': False,
+            'error': "File target missing or unsupported. Use username or room='all'."
+        }
+
+    def handle_user_login(self, username: str) -> dict:
+        """Register user login and return profile/history payload."""
+        login_info = self.user_store.register_login(username)
+        payload = dict(login_info)
+        # Room timeline replay is handled explicitly on room join.
+        payload['history'] = []
+        return payload
+
+    def get_room_history(self, room_name: str, limit: int = 50) -> List[dict]:
+        """Get latest timeline messages for a room."""
+        return self.user_store.get_room_history(room_name, limit=limit)
+
+    def persist_room_message(self, room_name: str, message: dict):
+        """Persist one room timeline message."""
+        self.user_store.append_room_message(room_name, message)
+
+    def handle_user_disconnect(self, username: str):
+        """Persist last-seen timestamp when user disconnects."""
+        self.user_store.update_last_seen(username)
+
+    def persist_message_for_users(self, message: dict):
+        """Persist broadcasted message for every known user."""
+        usernames = self.user_store.list_users()
+        if usernames:
+            self.user_store.append_message_for_users(usernames, message)
     
     def stop(self):
         """
         Stop the server and clean up resources.
         """
         self.running = False
+
+        with self.room_lock:
+            for room_queue in self.room_queues.values():
+                room_queue.put(None)
+            self.room_queues.clear()
+            self.room_workers.clear()
+            self.room_sequence_counter.clear()
+
+        with self.user_lock:
+            self.user_to_client.clear()
         
         # Close all client connections
         with self.clients_lock:
