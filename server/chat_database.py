@@ -66,9 +66,9 @@ class ChatDatabase:
             100000
         ).hex()
 
-    def ensure_room(self, room_name: str, created_by: str):
+    def ensure_room(self, room_name: str, created_by: str) -> bool:
         with self.lock, self._connect() as connection:
-            connection.execute(
+            cursor = connection.execute(
                 """
                 INSERT OR IGNORE INTO rooms (name, created_by)
                 VALUES (?, ?)
@@ -76,6 +76,7 @@ class ChatDatabase:
                 (room_name, created_by)
             )
             connection.commit()
+            return cursor.rowcount > 0
 
     def list_rooms(self) -> List[str]:
         with self.lock, self._connect() as connection:

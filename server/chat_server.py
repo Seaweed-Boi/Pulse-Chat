@@ -208,7 +208,10 @@ class ChatServer:
             return {"ok": False, "error": "Room name cannot be empty."}
 
         previous_room = client.current_room
-        self.database.ensure_room(room_name, client.username or "system")
+        room_created = self.database.ensure_room(
+            room_name,
+            client.username or "system"
+        )
 
         with self.clients_lock:
             if previous_room in self.active_rooms:
@@ -216,11 +219,21 @@ class ChatServer:
             self.active_rooms[room_name].add(client)
             client.current_room = room_name
 
+        if room_created:
+            self.broadcast_message(
+                MessageProtocol.create_message(
+                    MessageProtocol.TYPE_SYSTEM,
+                    "system",
+                    f"Room '{room_name}' was created by {client.username or 'system'}.",
+                )
+            )
+
         return {
             "ok": True,
             "message": f"Joined room '{room_name}'.",
             "previous_room": previous_room,
-            "room": room_name
+            "room": room_name,
+            "created": room_created,
         }
 
     def list_rooms(self) -> List[str]:

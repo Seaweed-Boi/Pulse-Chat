@@ -11,6 +11,7 @@ Key Networking Concepts:
 - Exception Handling: Graceful handling of disconnections and errors
 """
 
+import base64
 import threading
 import ssl
 from typing import Callable, Optional
@@ -262,6 +263,64 @@ class ClientHandler:
                             )
                             continue
 
+                        try:
+                            advertised_size = int(message.get("filesize", 0) or 0)
+                        except (TypeError, ValueError):
+                            self._send_file_error(
+                                f"Rejected file '{filename}' from {self.username}: invalid filesize field"
+                            )
+                            self.send_message(
+                                MessageProtocol.create_message(
+                                    MessageProtocol.TYPE_ERROR,
+                                    "system",
+                                    f"File '{filename}' was rejected by the server: invalid file size."
+                                )
+                            )
+                            continue
+                        try:
+                            decoded_file = base64.b64decode(
+                                file_data.encode("ascii"),
+                                validate=True
+                            )
+                        except Exception as exc:
+                            self._send_file_error(
+                                f"Rejected file '{filename}' from {self.username}: invalid payload ({exc})"
+                            )
+                            self.send_message(
+                                MessageProtocol.create_message(
+                                    MessageProtocol.TYPE_ERROR,
+                                    "system",
+                                    f"File '{filename}' was rejected by the server: invalid file payload."
+                                )
+                            )
+                            continue
+
+                        if len(decoded_file) > self.MAX_FILE_SIZE:
+                            self._send_file_error(
+                                f"Rejected file '{filename}' from {self.username}: decoded size {len(decoded_file)} bytes exceeds limit"
+                            )
+                            self.send_message(
+                                MessageProtocol.create_message(
+                                    MessageProtocol.TYPE_ERROR,
+                                    "system",
+                                    f"File '{filename}' exceeds the {self.MAX_FILE_SIZE // (1024 * 1024)} MB limit."
+                                )
+                            )
+                            continue
+
+                        if advertised_size and advertised_size != len(decoded_file):
+                            self._send_file_error(
+                                f"Rejected file '{filename}' from {self.username}: advertised size {advertised_size} does not match decoded size {len(decoded_file)}"
+                            )
+                            self.send_message(
+                                MessageProtocol.create_message(
+                                    MessageProtocol.TYPE_ERROR,
+                                    "system",
+                                    f"File '{filename}' was rejected by the server: file size mismatch."
+                                )
+                            )
+                            continue
+
                         direct_result = self.send_direct_message(
                             recipient,
                             MessageProtocol.create_message(
@@ -272,7 +331,7 @@ class ClientHandler:
                                 recipient=recipient,
                                 filename=filename,
                                 file_data=file_data,
-                                filesize=message.get("filesize", 0),
+                                filesize=len(decoded_file),
                                 room=self.current_room
                             )
                         )
@@ -315,6 +374,9 @@ class ClientHandler:
             print(f"[SERVER] Error sending to {self.username}: {e}")
             self.running = False
             return False
+
+    def _send_file_error(self, detail: str):
+        print(f"[SERVER][FILE_ERROR] {detail}")
     
     def cleanup(self):
         """
@@ -346,3 +408,4 @@ class ClientHandler:
             self.socket.close()
         except:
             pass
+    MAX_FILE_SIZE = 2 * 1024 * 1024

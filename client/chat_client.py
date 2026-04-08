@@ -1,4 +1,5 @@
 import base64
+import binascii
 import getpass
 import os
 import queue
@@ -44,6 +45,18 @@ class ChatClient:
         self.pending_messages: List[Dict] = []
         self.known_rooms: List[str] = []
         self.known_users: List[str] = []
+        self.stats_lock = threading.Lock()
+        self.stats = {
+            "started_at": None,
+            "reconnect_attempts": 0,
+            "successful_connections": 0,
+            "disconnects": 0,
+            "messages_sent": 0,
+            "messages_received": 0,
+            "bytes_sent": 0,
+            "bytes_received": 0,
+            "file_errors": 0,
+        }
 
     def set_credentials(self, username: str, password: str):
         self.username = username.strip()
@@ -54,6 +67,9 @@ class ChatClient:
             return
         self.running = True
         self.manual_disconnect = False
+        with self.stats_lock:
+            if self.stats["started_at"] is None:
+                self.stats["started_at"] = time.time()
         self.reconnect_thread = threading.Thread(
             target=self._reconnect_loop,
             daemon=True,
@@ -178,13 +194,25 @@ class ChatClient:
             self._emit_error("Choose a valid file to send.")
             return
 
-        file_size = os.path.getsize(file_path)
+        try:
+            file_size = os.path.getsize(file_path)
+        except OSError as exc:
+            self._record_file_error()
+            self._emit_error(f"Could not read file details: {exc}")
+            return
+
         if file_size > self.MAX_FILE_SIZE:
+            self._record_file_error()
             self._emit_error("Files must be 2 MB or smaller.")
             return
 
-        with open(file_path, "rb") as file_handle:
-            encoded_data = base64.b64encode(file_handle.read()).decode("ascii")
+        try:
+            with open(file_path, "rb") as file_handle:
+                encoded_data = base64.b64encode(file_handle.read()).decode("ascii")
+        except OSError as exc:
+            self._record_file_error()
+            self._emit_error(f"Could not open file '{file_path}': {exc}")
+            return
 
         filename = os.path.basename(file_path)
         self._queue_message(
@@ -200,6 +228,27 @@ class ChatClient:
                 room=self.current_room,
             ),
             buffered_notice=f"Buffered file '{filename}' for {recipient}.",
+        )
+
+    def send_corrupt_file_demo(self, recipient: str):
+        recipient = recipient.strip()
+        if not recipient:
+            self._emit_error("Choose a recipient before sending the demo file error.")
+            return
+
+        self._queue_message(
+            MessageProtocol.create_message(
+                MessageProtocol.TYPE_FILE,
+                self.username or "unknown",
+                "Demo corrupt file payload",
+                sender=self.username,
+                recipient=recipient,
+                filename="demo_corrupt.txt",
+                filesize=32,
+                file_data="!!!not-valid-base64!!!",
+                room=self.current_room,
+            ),
+            buffered_notice=f"Buffered corrupt demo file for {recipient}.",
         )
 
     def _queue_message(self, message: Dict, buffered_notice: str):
@@ -228,6 +277,9 @@ class ChatClient:
         try:
             encoded = MessageProtocol.encode_message(message)
             active_socket.sendall(encoded)
+            with self.stats_lock:
+                self.stats["messages_sent"] += 1
+                self.stats["bytes_sent"] += len(encoded)
             return True
         except Exception as exc:
             self._handle_disconnect(f"Connection dropped while sending: {exc}")
@@ -256,9 +308,14 @@ class ChatClient:
                     self._handle_disconnect("Server stopped or connection closed.")
                     break
 
+                with self.stats_lock:
+                    self.stats["bytes_received"] += len(data)
+
                 message = MessageProtocol.decode_message(data)
                 if not message:
                     continue
+                with self.stats_lock:
+                    self.stats["messages_received"] += 1
                 self._handle_incoming_message(message)
 
         except ConnectionResetError:
@@ -293,7 +350,15 @@ class ChatClient:
             self._emit("users_updated", users=self.known_users)
 
         if msg_type == MessageProtocol.TYPE_FILE:
-            saved_path = self._save_incoming_file(message)
+            try:
+                saved_path = self._save_incoming_file(message)
+            except (OSError, ValueError, binascii.Error) as exc:
+                self._record_file_error()
+                self._emit_error(
+                    f"Failed to save file '{message.get('filename', 'file')}': {exc}"
+                )
+                return
+
             notice = MessageProtocol.create_message(
                 MessageProtocol.TYPE_SYSTEM,
                 "system",
@@ -330,8 +395,10 @@ class ChatClient:
                 target_path = f"{base}_{counter}{ext}"
                 counter += 1
 
+        decoded_bytes = base64.b64decode(file_data.encode("ascii"), validate=True)
+
         with open(target_path, "wb") as output_file:
-            output_file.write(base64.b64decode(file_data.encode("ascii")))
+            output_file.write(decoded_bytes)
 
         return target_path
 
@@ -372,7 +439,11 @@ class ChatClient:
                 time.sleep(1)
                 continue
 
+            with self.stats_lock:
+                self.stats["reconnect_attempts"] += 1
             if self.connect():
+                with self.stats_lock:
+                    self.stats["successful_connections"] += 1
                 self._start_receiver()
             time.sleep(self.reconnect_delay)
 
@@ -383,6 +454,8 @@ class ChatClient:
         self._close_socket()
 
         if self.running and not self.manual_disconnect and was_connected:
+            with self.stats_lock:
+                self.stats["disconnects"] += 1
             self._emit_error(reason)
             self._emit_status("Offline. Waiting for the server to come back...")
 
@@ -422,6 +495,27 @@ class ChatClient:
     def _emit(self, event_type: str, **payload):
         if self.event_callback:
             self.event_callback(event_type, payload)
+
+    def _record_file_error(self):
+        with self.stats_lock:
+            self.stats["file_errors"] += 1
+
+    def get_performance_snapshot(self) -> Dict:
+        with self.stats_lock, self.pending_lock:
+            started_at = self.stats["started_at"]
+            uptime_seconds = 0.0
+            if started_at is not None:
+                uptime_seconds = max(0.0, time.time() - started_at)
+
+            snapshot = dict(self.stats)
+            snapshot["uptime_seconds"] = uptime_seconds
+            snapshot["buffered_messages"] = len(self.pending_messages)
+            snapshot["known_rooms"] = len(self.known_rooms)
+            snapshot["known_users"] = len(self.known_users)
+            snapshot["connected"] = self.connected
+            snapshot["session_ready"] = self.session_ready
+            snapshot["current_room"] = self.current_room
+        return snapshot
 
 
 class TerminalChatClient:
@@ -467,7 +561,7 @@ class TerminalChatClient:
         self.client.start()
         print("=" * 60)
         print("Pulse-Chat CLI started.")
-        print("Commands: /rooms, /users, /join <room>, /sendfile <user> <path>, /quit")
+        print("Commands: /rooms, /users, /join <room>, /sendfile <user> <path>, /sendfileerror <user>, /quit")
         print("=" * 60)
 
         try:
@@ -493,6 +587,13 @@ class TerminalChatClient:
                         continue
                     self.client.send_file(parts[1], parts[2])
                     continue
+                if user_input.startswith("/sendfileerror "):
+                    recipient = user_input[len("/sendfileerror "):].strip()
+                    if not recipient:
+                        print("[ERROR] Usage: /sendfileerror <user>")
+                        continue
+                    self.client.send_corrupt_file_demo(recipient)
+                    continue
                 self.client.send_chat(user_input)
         finally:
             self.client.stop()
@@ -501,6 +602,9 @@ class TerminalChatClient:
 
 class ChatClientApp:
     """Simple black-and-white Tkinter UI for Pulse-Chat."""
+
+    MAX_CHAT_LINES = 500
+    CHAT_TRIM_TO_LINES = 350
 
     def __init__(self, server_host: str = "localhost", server_port: int = 5555):
         import tkinter as tk
@@ -526,6 +630,8 @@ class ChatClientApp:
         self.recipient_var = tk.StringVar()
         self.status_var = tk.StringVar(value="Disconnected.")
         self.buffer_var = tk.StringVar(value="Buffered: 0")
+        self.performance_window = None
+        self.performance_labels: Dict[str, object] = {}
 
         self._build_ui(scrolledtext)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -583,6 +689,21 @@ class ChatClientApp:
             pady=6,
             font=header_font,
         ).grid(row=1, column=5)
+
+        tk.Button(
+            top_bar,
+            text="Performance",
+            command=self.open_performance_window,
+            bg="black",
+            fg="white",
+            activebackground="black",
+            activeforeground="white",
+            relief="solid",
+            bd=1,
+            padx=16,
+            pady=6,
+            font=header_font,
+        ).grid(row=1, column=6, padx=(8, 0))
 
         room_bar = tk.Frame(self.root, bg="black", padx=12, pady=8)
         room_bar.pack(fill="x")
@@ -863,12 +984,152 @@ class ChatClientApp:
     def _append_text(self, text: str):
         self.chat_output.configure(state="normal")
         self.chat_output.insert(self.tk.END, text + "\n")
+        self._trim_chat_output()
         self.chat_output.see(self.tk.END)
         self.chat_output.configure(state="disabled")
+
+    def _trim_chat_output(self):
+        line_count = int(self.chat_output.index("end-1c").split(".")[0])
+        if line_count <= self.MAX_CHAT_LINES:
+            return
+
+        trim_until = line_count - self.CHAT_TRIM_TO_LINES + 1
+        self.chat_output.delete("1.0", f"{trim_until}.0")
+
+    def open_performance_window(self):
+        if self.performance_window and self.performance_window.winfo_exists():
+            self.performance_window.lift()
+            return
+
+        window = self.tk.Toplevel(self.root)
+        window.title("Pulse-Chat Performance Meter")
+        window.geometry("420x360")
+        window.configure(bg="black")
+        window.resizable(False, False)
+        self.performance_window = window
+        self.performance_labels = {}
+
+        header_font = ("Courier", 13, "bold")
+        base_font = ("Courier", 11)
+
+        self.tk.Label(
+            window,
+            text="Live Performance Meter",
+            bg="black",
+            fg="white",
+            font=header_font,
+        ).pack(anchor="w", padx=14, pady=(14, 10))
+
+        metrics_frame = self.tk.Frame(window, bg="black")
+        metrics_frame.pack(fill="both", expand=True, padx=14, pady=(0, 14))
+
+        metric_names = [
+            ("Connection", "connection_state"),
+            ("Room", "current_room"),
+            ("Uptime", "uptime"),
+            ("Reconnect Attempts", "reconnect_attempts"),
+            ("Successful Connections", "successful_connections"),
+            ("Disconnects", "disconnects"),
+            ("Messages Sent", "messages_sent"),
+            ("Messages Received", "messages_received"),
+            ("Bytes Sent", "bytes_sent"),
+            ("Bytes Received", "bytes_received"),
+            ("Buffered Messages", "buffered_messages"),
+            ("Known Users", "known_users"),
+            ("Known Rooms", "known_rooms"),
+            ("File Errors", "file_errors"),
+        ]
+
+        for row, (label_text, key) in enumerate(metric_names):
+            self.tk.Label(
+                metrics_frame,
+                text=label_text,
+                bg="black",
+                fg="white",
+                font=base_font,
+                anchor="w",
+            ).grid(row=row, column=0, sticky="w", pady=3)
+            value_label = self.tk.Label(
+                metrics_frame,
+                text="--",
+                bg="black",
+                fg="white",
+                font=base_font,
+                anchor="e",
+            )
+            value_label.grid(row=row, column=1, sticky="e", padx=(20, 0), pady=3)
+            self.performance_labels[key] = value_label
+
+        metrics_frame.grid_columnconfigure(0, weight=1)
+        metrics_frame.grid_columnconfigure(1, weight=1)
+
+        window.protocol("WM_DELETE_WINDOW", self._close_performance_window)
+        self._refresh_performance_window()
+
+    def _close_performance_window(self):
+        if self.performance_window and self.performance_window.winfo_exists():
+            self.performance_window.destroy()
+        self.performance_window = None
+        self.performance_labels = {}
+
+    def _refresh_performance_window(self):
+        if not self.performance_window or not self.performance_window.winfo_exists():
+            self.performance_window = None
+            self.performance_labels = {}
+            return
+
+        snapshot = {}
+        if self.client:
+            snapshot = self.client.get_performance_snapshot()
+
+        connection_state = "Connected" if snapshot.get("connected") else "Offline"
+        if snapshot.get("session_ready"):
+            connection_state = "Connected / Ready"
+
+        values = {
+            "connection_state": connection_state,
+            "current_room": snapshot.get("current_room", "lobby"),
+            "uptime": self._format_duration(snapshot.get("uptime_seconds", 0.0)),
+            "reconnect_attempts": str(snapshot.get("reconnect_attempts", 0)),
+            "successful_connections": str(snapshot.get("successful_connections", 0)),
+            "disconnects": str(snapshot.get("disconnects", 0)),
+            "messages_sent": str(snapshot.get("messages_sent", 0)),
+            "messages_received": str(snapshot.get("messages_received", 0)),
+            "bytes_sent": self._format_bytes(snapshot.get("bytes_sent", 0)),
+            "bytes_received": self._format_bytes(snapshot.get("bytes_received", 0)),
+            "buffered_messages": str(snapshot.get("buffered_messages", 0)),
+            "known_users": str(snapshot.get("known_users", 0)),
+            "known_rooms": str(snapshot.get("known_rooms", 0)),
+            "file_errors": str(snapshot.get("file_errors", 0)),
+        }
+
+        for key, label in self.performance_labels.items():
+            label.config(text=values.get(key, "--"))
+
+        self.root.after(500, self._refresh_performance_window)
+
+    def _format_duration(self, seconds: float) -> str:
+        total_seconds = int(seconds)
+        hours = total_seconds // 3600
+        minutes = (total_seconds % 3600) // 60
+        secs = total_seconds % 60
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+    def _format_bytes(self, value: int) -> str:
+        units = ["B", "KB", "MB", "GB"]
+        size = float(value)
+        unit_index = 0
+        while size >= 1024 and unit_index < len(units) - 1:
+            size /= 1024
+            unit_index += 1
+        if unit_index == 0:
+            return f"{int(size)} {units[unit_index]}"
+        return f"{size:.1f} {units[unit_index]}"
 
     def _on_close(self):
         if self.client:
             self.client.stop()
+        self._close_performance_window()
         self.root.destroy()
 
     def run(self):
