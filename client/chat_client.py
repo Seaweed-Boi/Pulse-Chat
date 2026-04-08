@@ -1027,6 +1027,9 @@ class ChatClientApp:
             ("Connection", "connection_state"),
             ("Room", "current_room"),
             ("Uptime", "uptime"),
+            ("Message Rate", "message_rate"),
+            ("Network Throughput", "network_throughput"),
+            ("Connection Stability", "connection_stability"),
             ("Reconnect Attempts", "reconnect_attempts"),
             ("Successful Connections", "successful_connections"),
             ("Disconnects", "disconnects"),
@@ -1086,10 +1089,30 @@ class ChatClientApp:
         if snapshot.get("session_ready"):
             connection_state = "Connected / Ready"
 
+        uptime_seconds = max(snapshot.get("uptime_seconds", 0.0), 1.0)
+        total_messages = snapshot.get("messages_sent", 0) + snapshot.get("messages_received", 0)
+        total_bytes = snapshot.get("bytes_sent", 0) + snapshot.get("bytes_received", 0)
+        message_rate = total_messages / uptime_seconds
+        throughput_rate = total_bytes / uptime_seconds
+
+        successful_connections = snapshot.get("successful_connections", 0)
+        disconnects = snapshot.get("disconnects", 0)
+        if successful_connections <= 0:
+            stability_text = "No session data yet"
+        else:
+            stability_percent = max(
+                0.0,
+                ((successful_connections - disconnects) / successful_connections) * 100,
+            )
+            stability_text = f"{stability_percent:.0f}% stable"
+
         values = {
             "connection_state": connection_state,
             "current_room": snapshot.get("current_room", "lobby"),
             "uptime": self._format_duration(snapshot.get("uptime_seconds", 0.0)),
+            "message_rate": f"{message_rate:.2f} msg/s",
+            "network_throughput": f"{self._format_bytes(int(throughput_rate))}/s",
+            "connection_stability": stability_text,
             "reconnect_attempts": str(snapshot.get("reconnect_attempts", 0)),
             "successful_connections": str(snapshot.get("successful_connections", 0)),
             "disconnects": str(snapshot.get("disconnects", 0)),
